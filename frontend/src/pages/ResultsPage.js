@@ -31,7 +31,7 @@ function MatchCard({ match, index }) {
           <img
             src={match.thumbnail_url}
             alt="thumb"
-            className="w-full h-full object-cover"
+            className="w-16 h-16 object-cover rounded-lg"
             onError={e => { e.target.style.display = 'none'; }}
           />
         ) : (
@@ -44,7 +44,14 @@ function MatchCard({ match, index }) {
       {/* Info */}
       <div className="flex-1 min-w-0">
         <p className="text-white text-sm font-medium truncate">{match.title}</p>
-        <p className="text-gray-500 text-xs truncate mt-0.5">{match.url}</p>
+        <a
+          href={match.url}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-blue-400 hover:text-blue-300 underline cursor-pointer text-sm truncate block mt-0.5"
+        >
+          {match.url}
+        </a>
         <div className="flex items-center gap-3 mt-2">
           <span className="text-gray-400 text-xs">
             Similarity: <span className="text-white font-semibold">{Math.round(sim * 100)}%</span>
