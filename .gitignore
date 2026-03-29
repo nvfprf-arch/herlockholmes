@@ -1,0 +1,9 @@
+node_modules/
+venv/
+__pycache__/
+.env
+*.db
+ela_outputs/
+uploads/
+build/
+.DS_Store
