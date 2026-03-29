@@ -100,15 +100,7 @@ def run_misuse_check(image_path: str) -> dict:
 
         if lens_matches:
             print(f"[misuse_check] Lens returned {len(lens_matches)} matches — using Lens results")
-            matches = []
-            for i, item in enumerate(lens_matches):
-                similarity = max(0.40, 0.95 - i * 0.05)
-                matches.append({
-                    "title": item.get("title", "Unknown"),
-                    "url": item.get("link", ""),
-                    "thumbnail_url": item.get("imageUrl") or item.get("thumbnail", ""),
-                    "similarity_score": round(similarity, 2),
-                })
+            raw_items = lens_matches
         else:
             print("[misuse_check] Lens returned 0 matches — falling back to /images")
             fallback_response = requests.post(
@@ -121,17 +113,51 @@ def run_misuse_check(image_path: str) -> dict:
             fallback_response.raise_for_status()
             fallback_data = fallback_response.json()
             print(f"[misuse_check] /images fallback FULL response: {fallback_data}")
-            raw_results = fallback_data.get("images", [])
-            print(f"[misuse_check] /images fallback result count: {len(raw_results)}")
-            matches = []
-            for i, item in enumerate(raw_results):
+            raw_items = fallback_data.get("images", [])
+            print(f"[misuse_check] /images fallback result count: {len(raw_items)}")
+
+        # ── Parse raw items into match dicts ──────────────────────────────────
+        def parse_items(items):
+            out = []
+            for i, item in enumerate(items):
                 similarity = max(0.40, 0.95 - i * 0.05)
-                matches.append({
+                out.append({
                     "title": item.get("title", "Unknown"),
-                    "url": item.get("link", ""),
-                    "thumbnail_url": item.get("imageUrl") or item.get("thumbnailUrl", ""),
+                    "url": item.get("link") or item.get("url", ""),
+                    "thumbnail_url": item.get("imageUrl") or item.get("thumbnail") or item.get("thumbnailUrl", ""),
                     "similarity_score": round(similarity, 2),
                 })
+            return out
+
+        all_matches = parse_items(raw_items)
+
+        # ── Filter out shopping/product pages ────────────────────────────────
+        BLOCKED_URL_TERMS = {
+            "amazon", "flipkart", "myntra", "ajio", "meesho", "snapdeal",
+            "shopify", "shop", "store", "buy", "cart", "product",
+            "fashion", "kurti", "dress", "clothing", "fabric",
+        }
+        BLOCKED_TITLE_TERMS = {
+            "buy", "shop", "price", "discount", "offer", "sale", "rs.", "₹",
+        }
+
+        def is_shopping(m):
+            url_lower = m["url"].lower()
+            title_lower = m["title"].lower()
+            return (
+                any(t in url_lower for t in BLOCKED_URL_TERMS)
+                or any(t in title_lower for t in BLOCKED_TITLE_TERMS)
+            )
+
+        filtered = [m for m in all_matches if not is_shopping(m)]
+        print(f"[misuse_check] After shopping filter: {len(filtered)} of {len(all_matches)} remain")
+
+        # Fall back to unfiltered list if filtering removed too many results
+        if len(filtered) < 3:
+            print("[misuse_check] Too few after filtering — using unfiltered list")
+            matches = all_matches[:10]
+        else:
+            matches = filtered[:10]
 
         print(f"[misuse_check] Final parsed matches: {len(matches)}")
         return {"matches": matches, "total_matches": len(matches)}
@@ -173,45 +199,40 @@ def run_deepfake_check(image_path: str) -> dict:
             "model": "mock-deepfake-detector-v1",
         }
 
-    # Real implementation — DeepFace face analysis
-    print("[run_deepfake_check] MOCK_MODE=False — calling DeepFace.analyze()...")
-
-    def _analyze(actions):
+    # Real implementation — DeepFace extract_faces
+    print("[run_deepfake_check] MOCK_MODE=False — calling DeepFace.extract_faces()...")
+    try:
         from deepface import DeepFace
-        return DeepFace.analyze(
+
+        faces = DeepFace.extract_faces(
             img_path=image_path,
-            actions=actions,
             enforce_detection=False,
-            silent=True,
             detector_backend="opencv",
         )
+        print(f"[run_deepfake_check] extract_faces result: {faces}")
 
-    def _score_from_confidence(face_confidence):
-        if face_confidence > 0.9:
-            return 0.2, "High face confidence — likely authentic"
-        elif face_confidence > 0.7:
-            return 0.45, "Moderate face confidence — probably real"
-        elif face_confidence > 0.5:
-            return 0.65, "Low face confidence — uncertain authenticity"
+        if not faces:
+            print("[run_deepfake_check] No faces detected — score=0.5")
+            return {
+                "score": 0.5,
+                "flagged": False,
+                "confidence": "No face detected — result uncertain",
+                "model": "deepface-extract",
+            }
+
+        face_confidence = float(faces[0].get("confidence", 0.5))
+        print(f"[run_deepfake_check] face_confidence from extract_faces: {face_confidence}")
+
+        if face_confidence > 0.85:
+            deepfake_score = 0.15
+            explanation = "High face confidence — very likely authentic"
+        elif face_confidence > 0.6:
+            deepfake_score = 0.4
+            explanation = "Moderate face confidence — probably real"
         else:
-            return 0.85, "Very low face confidence — likely manipulated"
+            deepfake_score = 0.7
+            explanation = "Low face confidence — uncertain or possibly manipulated"
 
-    try:
-        # First attempt: gender only (avoids heavy age/race weight files)
-        try:
-            print("[run_deepfake_check] Attempting DeepFace with actions=['gender']...")
-            analysis = _analyze(["gender"])
-            print(f"[run_deepfake_check] DeepFace raw result: {analysis}")
-        except Exception as inner_exc:
-            print(f"[run_deepfake_check] gender-only attempt failed ({inner_exc}), retrying with no actions...")
-            analysis = _analyze([])
-            print(f"[run_deepfake_check] DeepFace retry raw result: {analysis}")
-
-        result = analysis[0] if isinstance(analysis, list) else analysis
-        face_confidence = float(result.get("face_confidence", 0.0))
-        print(f"[run_deepfake_check] face_confidence extracted: {face_confidence}")
-
-        deepfake_score, explanation = _score_from_confidence(face_confidence)
         flagged = deepfake_score > 0.7
         print(f"[run_deepfake_check] deepfake_score={deepfake_score}, flagged={flagged}, explanation='{explanation}'")
 
@@ -219,17 +240,17 @@ def run_deepfake_check(image_path: str) -> dict:
             "score": deepfake_score,
             "flagged": flagged,
             "confidence": explanation,
-            "model": "deepface-opencv",
+            "model": "deepface-extract",
         }
 
     except Exception as exc:
-        print(f"[run_deepfake_check] ERROR: {exc} — falling back to mock")
-        logger.error("run_deepfake_check failed: %s — falling back to mock", exc)
+        print(f"[run_deepfake_check] ERROR (exact): {type(exc).__name__}: {exc}")
+        logger.error("run_deepfake_check failed: %s", exc)
         return {
-            "score": 0.82,
-            "flagged": True,
-            "confidence": "High",
-            "model": "mock-deepfake-detector-v1",
+            "score": 0.5,
+            "flagged": False,
+            "confidence": "Analysis failed — result uncertain",
+            "model": "deepface-extract-failed",
         }
 
 
