@@ -7,3 +7,5 @@ python-dotenv
 requests
 deepface
 tf-keras
+opencv-python
+numpy

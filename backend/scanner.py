@@ -199,58 +199,105 @@ def run_deepfake_check(image_path: str) -> dict:
             "model": "mock-deepfake-detector-v1",
         }
 
-    # Real implementation — DeepFace extract_faces
-    print("[run_deepfake_check] MOCK_MODE=False — calling DeepFace.extract_faces()...")
+    # Real implementation — frequency analysis + face detection
+    def detect_ai_generated(img_path: str) -> float:
+        import cv2
+        import numpy as np
+
+        img = cv2.imread(img_path)
+        if img is None:
+            print("[deepfake_check] cv2.imread returned None — cannot analyse")
+            return 0.5
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # Method 1: FFT frequency analysis — GAN images have distinctive artifacts
+        f = np.fft.fft2(gray)
+        fshift = np.fft.fftshift(f)
+        magnitude = 20 * np.log(np.abs(fshift) + 1)
+        h, w = magnitude.shape
+        center_region = magnitude[h // 4: 3 * h // 4, w // 4: 3 * w // 4]
+        edge_region = np.concatenate([magnitude[: h // 4].flatten(), magnitude[3 * h // 4 :].flatten()])
+        center_mean = np.mean(center_region)
+        edge_mean = np.mean(edge_region)
+        freq_ratio = edge_mean / (center_mean + 1e-10)
+
+        # Method 2: Laplacian noise variance — AI images are unnaturally clean
+        laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+        noise_score = np.var(laplacian)
+
+        # Method 3: HSV saturation std — AI images have uniform saturation
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        sat_std = np.std(hsv[:, :, 1])
+
+        print(f"[deepfake_check] freq_ratio={freq_ratio:.3f}, noise_score={noise_score:.1f}, sat_std={sat_std:.1f}")
+
+        score = 0.3  # base
+        if freq_ratio < 0.15:
+            score += 0.35
+            print("[deepfake_check] Low freq_ratio (+0.35) — possible GAN artifact")
+        if noise_score < 50:
+            score += 0.2
+            print("[deepfake_check] Low noise_score (+0.20) — unusually clean image")
+        if sat_std < 30:
+            score += 0.15
+            print("[deepfake_check] Low sat_std (+0.15) — uniform saturation")
+
+        return min(score, 0.95)
+
+    print("[run_deepfake_check] MOCK_MODE=False — running face detection + frequency analysis...")
     try:
         from deepface import DeepFace
 
+        # Step 1: check if a face exists
+        print("[run_deepfake_check] Calling DeepFace.extract_faces()...")
         faces = DeepFace.extract_faces(
             img_path=image_path,
             enforce_detection=False,
             detector_backend="opencv",
         )
-        print(f"[run_deepfake_check] extract_faces result: {faces}")
+        face_count = len(faces) if faces else 0
+        print(f"[run_deepfake_check] extract_faces found {face_count} face(s)")
 
-        if not faces:
-            print("[run_deepfake_check] No faces detected — score=0.5")
+        if not faces or face_count == 0:
+            print("[run_deepfake_check] No face detected — score=0.3, not flagged")
             return {
-                "score": 0.5,
+                "score": 0.3,
                 "flagged": False,
-                "confidence": "No face detected — result uncertain",
-                "model": "deepface-extract",
+                "confidence": "No face detected",
+                "model": "freq-analysis",
             }
 
-        face_confidence = float(faces[0].get("confidence", 0.5))
-        print(f"[run_deepfake_check] face_confidence from extract_faces: {face_confidence}")
+        # Step 2: run frequency/noise/saturation analysis
+        print("[run_deepfake_check] Face found — running detect_ai_generated()...")
+        deepfake_score = detect_ai_generated(image_path)
+        flagged = deepfake_score > 0.55
 
-        if face_confidence > 0.85:
-            deepfake_score = 0.15
-            explanation = "High face confidence — very likely authentic"
-        elif face_confidence > 0.6:
-            deepfake_score = 0.4
-            explanation = "Moderate face confidence — probably real"
+        if deepfake_score > 0.7:
+            explanation = "High AI probability — likely generated or manipulated"
+        elif deepfake_score > 0.55:
+            explanation = "Moderate AI signals — possibly manipulated"
+        elif deepfake_score > 0.35:
+            explanation = "Low AI signals — probably authentic"
         else:
-            deepfake_score = 0.7
-            explanation = "Low face confidence — uncertain or possibly manipulated"
+            explanation = "Very low AI signals — likely authentic"
 
-        flagged = deepfake_score > 0.7
-        print(f"[run_deepfake_check] deepfake_score={deepfake_score}, flagged={flagged}, explanation='{explanation}'")
-
+        print(f"[run_deepfake_check] Final: score={deepfake_score}, flagged={flagged}, explanation='{explanation}'")
         return {
-            "score": deepfake_score,
+            "score": round(deepfake_score, 3),
             "flagged": flagged,
             "confidence": explanation,
-            "model": "deepface-extract",
+            "model": "freq-analysis",
         }
 
     except Exception as exc:
-        print(f"[run_deepfake_check] ERROR (exact): {type(exc).__name__}: {exc}")
+        print(f"[run_deepfake_check] ERROR — {type(exc).__name__}: {exc}")
         logger.error("run_deepfake_check failed: %s", exc)
         return {
             "score": 0.5,
             "flagged": False,
             "confidence": "Analysis failed — result uncertain",
-            "model": "deepface-extract-failed",
+            "model": "freq-analysis-failed",
         }
 
 
