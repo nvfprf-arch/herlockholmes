@@ -205,7 +205,7 @@ export default function ResultsPage() {
               {dfScore}% probability
             </p>
             <p className="text-gray-500 text-xs">
-              {deepfake.flagged ? 'Likely synthetic' : 'Likely authentic'}
+              {dfScore > 70 ? 'Likely synthetic' : dfScore >= 50 ? 'Uncertain' : 'Likely authentic'}
             </p>
           </div>
 

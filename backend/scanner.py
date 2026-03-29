@@ -21,7 +21,8 @@ logger = logging.getLogger(__name__)
 
 def run_misuse_check(image_path: str) -> dict:
     """Reverse image search to detect misuse."""
-    print(f"[run_misuse_check] Starting — MOCK_MODE={MOCK_MODE}")
+    MOCK_MODE = os.environ.get("MOCK_MODE", "True").strip().lower() == "true"
+    print(f"[run_misuse_check] Starting — MOCK_MODE={MOCK_MODE} (raw: '{os.environ.get('MOCK_MODE')}')")
     if MOCK_MODE:
         return {
             "matches": [
@@ -70,17 +71,32 @@ def run_misuse_check(image_path: str) -> dict:
         serper_response = requests.post(
             "https://google.serper.dev/lens",
             headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
-            json={"url": public_url},
+            json={"url": public_url, "gl": "in", "hl": "en"},
             timeout=15,
         )
         print(f"[misuse_check] Serper Lens status: {serper_response.status_code}")
         serper_response.raise_for_status()
         serper_data = serper_response.json()
         print(f"[misuse_check] Serper Lens response keys: {list(serper_data.keys())}")
+        # Print length of every list/dict key so we can see which has data
+        for k, v in serper_data.items():
+            if isinstance(v, list):
+                print(f"[misuse_check]   key='{k}' → list of {len(v)} items")
+            elif isinstance(v, dict):
+                print(f"[misuse_check]   key='{k}' → dict with keys {list(v.keys())}")
+            else:
+                print(f"[misuse_check]   key='{k}' → {v!r}")
         print(f"[misuse_check] Serper Lens FULL response: {serper_data}")
 
-        # ── Step 3: Use Lens matches if present, otherwise fallback ───────────────
-        lens_matches = serper_data.get("matches") or []
+        # ── Step 3: Use Lens matches if present (check all possible keys) ─────────
+        lens_matches = (
+            serper_data.get("matches")
+            or serper_data.get("visual_matches")
+            or serper_data.get("organic")
+            or serper_data.get("knowledgeGraph", {}).get("attributes", [])
+            or []
+        )
+        print(f"[misuse_check] lens_matches count after checking all keys: {len(lens_matches)}")
 
         if lens_matches:
             print(f"[misuse_check] Lens returned {len(lens_matches)} matches — using Lens results")
@@ -146,9 +162,8 @@ def run_misuse_check(image_path: str) -> dict:
 
 def run_deepfake_check(image_path: str) -> dict:
     """Deepfake/face-analysis check."""
-    print(f"[run_deepfake_check] Starting — MOCK_MODE={MOCK_MODE}")
-    print(f"[run_deepfake_check] os.environ MOCK_MODE raw value: '{os.environ.get('MOCK_MODE')}'")
-    print(f"[run_deepfake_check] Parsed boolean MOCK_MODE being used: {MOCK_MODE}")
+    MOCK_MODE = os.environ.get("MOCK_MODE", "True").strip().lower() == "true"
+    print(f"[run_deepfake_check] Starting — MOCK_MODE={MOCK_MODE} (raw: '{os.environ.get('MOCK_MODE')}')")
     if MOCK_MODE:
         print("[run_deepfake_check] MOCK_MODE=True — returning mock data, DeepFace NOT called")
         return {
@@ -160,35 +175,43 @@ def run_deepfake_check(image_path: str) -> dict:
 
     # Real implementation — DeepFace face analysis
     print("[run_deepfake_check] MOCK_MODE=False — calling DeepFace.analyze()...")
-    try:
-        from deepface import DeepFace  # imported here to avoid slow startup
 
-        analysis = DeepFace.analyze(
+    def _analyze(actions):
+        from deepface import DeepFace
+        return DeepFace.analyze(
             img_path=image_path,
-            actions=["age", "gender", "race"],
+            actions=actions,
             enforce_detection=False,
             silent=True,
+            detector_backend="opencv",
         )
 
-        print(f"[run_deepfake_check] DeepFace raw result: {analysis}")
+    def _score_from_confidence(face_confidence):
+        if face_confidence > 0.9:
+            return 0.2, "High face confidence — likely authentic"
+        elif face_confidence > 0.7:
+            return 0.45, "Moderate face confidence — probably real"
+        elif face_confidence > 0.5:
+            return 0.65, "Low face confidence — uncertain authenticity"
+        else:
+            return 0.85, "Very low face confidence — likely manipulated"
+
+    try:
+        # First attempt: gender only (avoids heavy age/race weight files)
+        try:
+            print("[run_deepfake_check] Attempting DeepFace with actions=['gender']...")
+            analysis = _analyze(["gender"])
+            print(f"[run_deepfake_check] DeepFace raw result: {analysis}")
+        except Exception as inner_exc:
+            print(f"[run_deepfake_check] gender-only attempt failed ({inner_exc}), retrying with no actions...")
+            analysis = _analyze([])
+            print(f"[run_deepfake_check] DeepFace retry raw result: {analysis}")
 
         result = analysis[0] if isinstance(analysis, list) else analysis
         face_confidence = float(result.get("face_confidence", 0.0))
         print(f"[run_deepfake_check] face_confidence extracted: {face_confidence}")
 
-        if face_confidence > 0.9:
-            deepfake_score = 0.2
-            explanation = "High face confidence — likely authentic"
-        elif face_confidence > 0.7:
-            deepfake_score = 0.45
-            explanation = "Moderate face confidence — probably real"
-        elif face_confidence > 0.5:
-            deepfake_score = 0.65
-            explanation = "Low face confidence — uncertain authenticity"
-        else:
-            deepfake_score = 0.85
-            explanation = "Very low face confidence — likely manipulated"
-
+        deepfake_score, explanation = _score_from_confidence(face_confidence)
         flagged = deepfake_score > 0.7
         print(f"[run_deepfake_check] deepfake_score={deepfake_score}, flagged={flagged}, explanation='{explanation}'")
 
@@ -196,7 +219,7 @@ def run_deepfake_check(image_path: str) -> dict:
             "score": deepfake_score,
             "flagged": flagged,
             "confidence": explanation,
-            "model": "deepface-analysis",
+            "model": "deepface-opencv",
         }
 
     except Exception as exc:
@@ -217,6 +240,8 @@ def run_ela_check(image_path: str) -> dict:
     Error Level Analysis — always runs real regardless of MOCK_MODE.
     Saves a heatmap and returns flagged status + suspicious regions.
     """
+    MOCK_MODE = os.environ.get("MOCK_MODE", "True").strip().lower() == "true"
+    print(f"[run_ela_check] Starting — MOCK_MODE={MOCK_MODE} (raw: '{os.environ.get('MOCK_MODE')}')")
     try:
         from PIL import Image, ImageChops, ImageEnhance
         import io
